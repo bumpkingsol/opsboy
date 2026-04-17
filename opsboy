@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+opsboy - Unified operations CLI for AI operators
+"""
+import argparse, sqlite3, json, os, sys, time, subprocess
+from pathlib import Path
+from datetime import datetime
+
+DB_PATH = os.path.expanduser("~/.opsboy.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            priority TEXT DEFAULT 'medium',
+            tags TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            due_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag TEXT,
+            message TEXT NOT NULL,
+            data TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            value REAL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS check_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            check_name TEXT,
+            status TEXT,
+            message TEXT,
+            checked_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    return conn
+
+def cmd_task(args):
+    conn = get_db()
+    if args.sub == "add":
+        conn.execute("INSERT INTO tasks (description, priority, tags, due_at) VALUES (?, ?, ?, ?)",
+                     (args.description, args.priority, args.tags, args.due))
+        conn.commit()
+        print(f"Task added: {args.description}")
+    elif args.sub == "list":
+        rows = conn.execute("SELECT id, description, status, priority, tags, due_at FROM tasks ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at DESC").fetchall()
+        if not rows:
+            print("No tasks.")
+            return
+        print(f"{'ID':<4} {'Status':<12} {'Priority':<8} {'Description':<40} {'Tags':<20}")
+        print("-" * 90)
+        for r in rows:
+            print(f"{r[0]:<4} {r[2]:<12} {r[3]:<8} {r[1][:38]:<40} {r[4] or '':<20}")
+    elif args.sub == "done":
+        conn.execute("UPDATE tasks SET status='completed', updated_at=datetime('now') WHERE id=?", (args.task_id,))
+        conn.commit()
+        print(f"Task {args.task_id} marked done.")
+    elif args.sub == "note":
+        note = f"[{datetime.now().isoformat()}] {args.text}"
+        conn.execute("UPDATE tasks SET notes = COALESCE(notes, '') || ? || char(10) WHERE id=?", (note, args.task_id))
+        conn.commit()
+        print(f"Note added to task {args.task_id}.")
+    conn.close()
+
+def cmd_log(args):
+    conn = get_db()
+    data = json.dumps({"val": args.data}) if args.data else None
+    conn.execute("INSERT INTO events (tag, message, data) VALUES (?, ?, ?)", (args.tag, args.message, data))
+    conn.commit()
+    print(f"Logged: [{args.tag or 'event'}] {args.message}")
+    conn.close()
+
+def cmd_log_show(args):
+    conn = get_db()
+    query = "SELECT created_at, tag, message FROM events"
+    params = []
+    if args.tag:
+        query += " WHERE tag = ?"
+        params.append(args.tag)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(args.limit)
+    rows = conn.execute(query, params).fetchall()
+    for r in rows:
+        print(f"{r[0]:<27} [{r[1] or '':<12}] {r[2]}")
+    conn.close()
+
+def cmd_metric(args):
+    conn = get_db()
+    if args.sub == "inc":
+        conn.execute("INSERT INTO metrics (name, value) VALUES (?, 1) ON CONFLICT(name) DO UPDATE SET value = value + 1, updated_at = datetime('now')", (args.name,))
+        conn.commit()
+        print(f"Incremented: {args.name}")
+    elif args.sub == "set":
+        conn.execute("INSERT INTO metrics (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = ?, updated_at = datetime('now')", (args.name, args.value, args.value))
+        conn.commit()
+        print(f"Set {args.name} = {args.value}")
+    elif args.sub == "get":
+        row = conn.execute("SELECT name, value, updated_at FROM metrics WHERE name = ?", (args.name,)).fetchone()
+        if row:
+            print(f"{row[0]} = {row[1]} (updated {row[2]})")
+        else:
+            print(f"Metric '{args.name}' not found.")
+    elif args.sub == "list":
+        rows = conn.execute("SELECT name, value, updated_at FROM metrics ORDER BY updated_at DESC").fetchall()
+        for r in rows:
+            print(f"{r[0]:<30} {r[1]:<10} {r[2]}")
+    conn.close()
+
+def cmd_check(args):
+    conn = get_db()
+    checks_dir = Path(__file__).parent / "checks"
+    results = []
+    if checks_dir.exists():
+        sys.path.insert(0, str(checks_dir))
+        for f in sorted(checks_dir.glob("*.py")):
+            if f.name.startswith("_"):
+                continue
+            mod_name = f.stem
+            try:
+                mod = __import__(mod_name)
+                status, msg = mod.check()
+                results.append((mod_name, status, msg))
+                conn.execute("INSERT INTO check_results (check_name, status, message) VALUES (?, ?, ?)", (mod_name, status, msg))
+            except Exception as e:
+                results.append((mod_name, "fail", str(e)))
+    conn.commit()
+    print(f"\n{'Check':<30} {'Status':<8} {'Message'}")
+    print("-" * 70)
+    for name, status, msg in results:
+        icon = {"ok": "✓", "warn": "⚠", "fail": "✗"}.get(status, "?")
+        print(f"{name:<30} {icon} {status:<6} {msg or ''}")
+    conn.close()
+
+def cmd_runbook(args):
+    rb_dir = Path.home() / ".opsboy" / "runbooks"
+    if args.sub == "show":
+        rb_file = rb_dir / f"{args.name}.md"
+        if rb_file.exists():
+            print(rb_file.read_text())
+        else:
+            print(f"Runbook '{args.name}' not found at {rb_file}")
+    elif args.sub == "list":
+        if rb_dir.exists():
+            for f in sorted(rb_dir.glob("*.md")):
+                print(f"  {f.stem}")
+        else:
+            print("No runbooks defined.")
+
+def main():
+    parser = argparse.ArgumentParser(prog="opsboy")
+    sub = parser.add_subparsers()
+
+    p_task = sub.add_parser("task")
+    p_task_sp = p_task.add_subparsers()
+    p_task_add = p_task_sp.add_parser("add")
+    p_task_add.add_argument("description")
+    p_task_add.add_argument("-p", "--priority", default="medium")
+    p_task_add.add_argument("-t", "--tags", default=None)
+    p_task_add.add_argument("-d", "--due", default=None)
+    p_task_list = p_task_sp.add_parser("list")
+    p_task_done = p_task_sp.add_parser("done")
+    p_task_done.add_argument("task_id", type=int)
+    p_task_note = p_task_sp.add_parser("note")
+    p_task_note.add_argument("task_id", type=int)
+    p_task_note.add_argument("text")
+    p_task.set_defaults(sub="list", func=cmd_task)
+
+    p_log = sub.add_parser("log")
+    p_log_sp = p_log.add_subparsers()
+    p_log_add = p_log_sp.add_parser("add")
+    p_log_add.add_argument("message")
+    p_log_add.add_argument("--tag", default=None)
+    p_log_add.add_argument("--data", default=None)
+    p_log_show = p_log_sp.add_parser("show")
+    p_log_show.add_argument("--tag", default=None)
+    p_log_show.add_argument("--limit", type=int, default=20)
+    p_log.set_defaults(sub="add", func=cmd_log)
+
+    p_metric = sub.add_parser("metric")
+    p_metric_sp = p_metric.add_subparsers()
+    p_metric_inc = p_metric_sp.add_parser("inc")
+    p_metric_inc.add_argument("name")
+    p_metric_set = p_metric_sp.add_parser("set")
+    p_metric_set.add_argument("name")
+    p_metric_set.add_argument("value", type=float)
+    p_metric_get = p_metric_sp.add_parser("get")
+    p_metric_get.add_argument("name")
+    p_metric_list = p_metric_sp.add_parser("list")
+    p_metric.set_defaults(sub="inc", func=cmd_metric)
+
+    p_check = sub.add_parser("check")
+    p_check_sp = p_check.add_subparsers()
+    p_check_run = p_check_sp.add_parser("run")
+    p_check.set_defaults(sub="run", func=cmd_check)
+
+    p_rb = sub.add_parser("runbook")
+    p_rb_sp = p_rb.add_subparsers()
+    p_rb_show = p_rb_sp.add_parser("show")
+    p_rb_show.add_argument("name")
+    p_rb_list = p_rb_sp.add_parser("list")
+    p_rb.set_defaults(sub="list", func=cmd_runbook)
+
+    args = parser.parse_args()
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
